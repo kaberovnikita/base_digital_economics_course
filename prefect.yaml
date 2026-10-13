@@ -1,0 +1,41 @@
+name: course-etl
+build: []
+push: []
+pull:
+  - prefect.deployments.steps.set_working_directory:
+      directory: /opt/prefect/flows
+
+deployments:
+  - name: clickhouse-agg-hourly
+    entrypoint: clickhouse_agg_flow.py:clickhouse_agg_flow
+    concurrency_limit: 1
+    work_pool:
+      name: etl-pool
+    schedules:
+      - cron: "0 * * * *"
+        timezone: Europe/Moscow
+        active: true
+
+  - name: site-visits-hourly
+    entrypoint: daily_etl.py:site_visits_flow
+    concurrency_limit: 1
+    work_pool:
+      name: etl-pool
+    parameters:
+      process_date: null
+    schedules:
+      - cron: "0 * * * *"
+        timezone: Europe/Moscow
+        active: true
+
+  - name: user-payments-hourly
+    entrypoint: daily_etl.py:user_payments_flow
+    concurrency_limit: 1
+    work_pool:
+      name: etl-pool
+    parameters:
+      process_date: null
+    schedules:
+      - cron: "30 * * * *"
+        timezone: Europe/Moscow
+        active: true

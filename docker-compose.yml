@@ -1,0 +1,151 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: etl_postgres
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./dump.sql:/docker-entrypoint-initdb.d/dump.sql:ro
+    ports:
+      - "5434:5432"
+    networks:
+      - etl_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  minio:
+    image: "chainguard/minio:latest"
+    container_name: etl_minio
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio12345
+    command: server /data --console-address ":9001"
+    volumes:
+      - ./minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - etl_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: etl_clickhouse
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-etl}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-etl_password}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse-users:/etc/clickhouse-server/users.d
+    ports:
+      - "8123:8123"
+    networks:
+      - etl_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prefect-server:
+    image: prefecthq/prefect:3-latest
+    container_name: etl_prefect_server
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    command: prefect server start --host 0.0.0.0
+    environment:
+      - PREFECT_API_URL=http://prefect-server:4200/api
+      - PREFECT_UI_API_URL=http://localhost:4200/api
+      - PREFECT_SERVER_API_HOST=0.0.0.0
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "4200:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - etl_net
+    restart: unless-stopped
+
+
+  prefect-cli:
+    image: prefecthq/prefect:3-latest
+    container_name: etl_prefect_cli
+    entrypoint: >
+      /bin/sh -c "pip install pandas sqlalchemy boto3 requests 'psycopg[binary]==3.2.13' &&
+      tail -f /dev/null"
+    environment: &flow_environment
+      - PREFECT_API_URL=http://prefect-server:4200/api
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_BUCKET=etl-source
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minio}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minio12345}
+      - CH_URL=http://clickhouse:8123
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-etl}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-etl_password}
+      - POSTGRES_HOST=postgres:5432
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes: &flow_volumes
+      - ./flows:/opt/prefect/flows
+      - ./prefect.yaml:/opt/prefect/flows/prefect.yaml:ro
+    depends_on:
+      - prefect-server
+    networks:
+      - etl_net
+    restart: unless-stopped
+
+  prefect-worker:
+    image: prefecthq/prefect:3-latest
+    container_name: etl_prefect_worker
+    working_dir: /opt/prefect/flows
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        pip install --no-cache-dir requests==2.32.5 boto3 'psycopg[binary]==3.2.13'
+        prefect work-pool inspect etl-pool >/dev/null 2>&1 || prefect work-pool create --type process etl-pool
+        prefect deploy --all --no-prompt
+        exec prefect worker start --pool etl-pool --type process --limit 1
+    environment: *flow_environment
+    volumes: *flow_volumes
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - etl_net
+    restart: unless-stopped
+
+networks:
+  etl_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  clickhouse_data:
